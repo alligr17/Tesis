@@ -1,0 +1,680 @@
+---
+title: "TESIS2"
+author: "Allison Granda Romero"
+date: "`r Sys.Date()`"
+output: html_document
+  word_document: default
+  html_document: default
+---
+
+#Funciones
+#Mezclas de azúcares
+```{r}
+archivos <- list.files("./data/",pattern = "\\.csv$", ignore.case = TRUE, full.names = TRUE)
+lista_datos <- lapply(archivos, function(x)
+  read.csv(x, sep = ";", header = FALSE))
+archivos_names <- list.files("./data/")
+
+if (!dir.exists("results")) {
+  dir.create("results")
+}
+
+archivos_names <- tools::file_path_sans_ext(basename(archivos))
+
+for (l in seq_along(lista_datos)) {
+  write.csv(
+    lista_datos[[l]],
+    file = file.path("results", paste0(archivos_names[l], "_procesado.csv")),
+    row.names = FALSE
+  )
+}
+```
+
+
+#Formato IR a Spectra
+```{r}
+fun_to_spectra <- function(X){
+  spectra <- as.data.frame((ir_flatten(X)))
+  wn <- spectra[, 1]
+  spectra <- spectra[, -1]
+  rownames(spectra) <- wn
+  colnames(spectra) <- X$sample_id
+  spectra.t <- t(spectra)
+  return(spectra.t)
+}
+```
+
+#Spectra a IR
+```{r}
+fun_to_ir <- function(s, X) {
+  l <- nrow(s)
+  wn <- colnames(s)
+  for (i in 1:l) {
+    s_i <- as.numeric(s[i, ])
+    df_i <- data.frame(x = rev(wn), y = rev(s_i))
+    df_i <- as.data.frame(lapply(df_i,as.numeric))
+    X$spectra[[i]] <- df_i
+  }
+  return(X)
+}
+```
+
+#Primera Derivada
+```{r}
+Primeraderivada<-function(X){
+  
+  X %>%
+    ir_normalise()  %>%
+    ir_smooth(method = "sg", p = 2, n = 11, m = 0)%>%   
+    ir_smooth(method = "sg", p = 2, n = 11, m = 1) }
+```
+
+#Segunda Derivada
+```{r}
+Segundaderivada_ir <- function(ir_obj) {
+  
+  spectra <- fun_to_spectra(ir_obj)
+  m <- as.matrix(spectra)
+
+  m[is.na(m)] <- 0
+
+  bl <- baseline::baseline(m, method = "als")
+  blc <- bl@corrected
+  blc[blc < 0] <- 0
+
+  ir_bl <- fun_to_ir(blc, ir_obj)
+
+  sg_mat <- fun_to_spectra(ir_bl)
+  sg_der2 <- t(apply(sg_mat, 1, function(x)
+    signal::sgolayfilt(x, p = 2, n = 13, m = 2)
+  ))
+
+  colnames(sg_der2) <- colnames(sg_mat)
+
+  return(as.data.frame(sg_der2))
+}
+```
+
+#RMSE
+```{r}
+funrmse <- function(pred, actual) {
+  n <- length(pred)
+  rmse <- sqrt(sum((pred - actual)^2) / n)
+
+  return(rmse)
+}
+```
+
+#Diseño del experimento
+##Definir los rangos de las restricciones
+```{r}
+#Límites inferiores
+lc <- c(
+  Sacarosa   = 0,
+  Fructosa = 0,
+  Glucosa = 0
+)
+
+#Límites superiores
+uc <- c(
+  Sacarosa   = 6,
+  Fructosa = 6,
+  Glucosa = 6
+)
+```
+
+##Diseño de mezclas bajo las restricciones
+```{r}
+design <- data.frame(
+  Glucosa = c(
+    6, 0, 0, 3, 3, 0, 2, 4.5, 4.5, 0,
+    1.5, 1.5, 0, 2.25, 2.25, 1.5, 3.75, 3.75,
+    1.25, 1, 1.25, 1, 2.73, 2.73, 0.55, 3, 1, 0.5, 1, 1.5, 2, 2.5
+  ),
+  Fructosa = c(
+    0, 6, 0, 3, 0, 3, 2, 1.5, 0, 4.5,
+    4.5, 0, 1.5, 2.25, 1.5, 2.25, 1, 1.25,
+    3.75, 3.75, 1, 1.25, 2.72, 0.55, 2.72, 2, 3, 0.5, 1, 1.5, 2, 2.5
+  ),
+  Sacarosa = c(
+    0, 0, 6, 0, 3, 3, 2, 0, 1.5, 1.5,
+    0, 4.5, 4.5, 1.5, 2.25, 2.25, 1.25, 1,
+    1, 1.25, 3.75, 3.75, 0.55, 2.72, 2.73, 1, 2, 0.5, 1, 1.5, 2, 2.5
+  )
+)
+print(design)
+```
+
+##Gráfica de dispersión ternaria
+```{r}
+library(ggtern)
+ggtern(data = design,
+       aes(x = Glucosa,
+           y = Fructosa,
+           z = Sacarosa)) +
+  geom_point(size = 4, color = "magenta") 
+  labs(
+    title = "Diseño de mezclas",
+    T = "Glucosa (%)",
+    L = "Fructosa (%)",
+    R = "Sacarosa (%)"
+  ) +
+  theme_minimal()
+```
+
+#Importación de datos
+##Mezclas
+```{r}
+library(ir)
+
+Mezclas <- list.files("./data/", pattern = "\\.csv$|\\.CSV$", 
+                     full.names = TRUE, ignore.case = TRUE)
+
+leer_y_recortar <- function(archivo) {
+  datos <- read.csv(archivo, sep = ";", header = FALSE)
+  datos <- datos[complete.cases(datos), ]
+  
+  idx <- datos[[1]] >= 850 & datos[[1]] <= 1200
+  datos_filtrados <- datos[idx, ]
+  
+  colnames(datos_filtrados) <- c("x", "y")
+  
+  return(datos_filtrados)
+}
+
+datos_recortados <- lapply(Mezclas, leer_y_recortar)
+
+metadata <- data.frame(
+  sample_id = tools::file_path_sans_ext(basename(Mezclas)),
+  filename = basename(Mezclas),
+  n_points = sapply(datos_recortados, nrow),
+  stringsAsFactors = FALSE
+)
+
+data_ir <- metadata
+data_ir$spectra <- datos_recortados
+data_a2_obj_crop <- ir_as_ir(
+  data_ir)
+```
+
+#Gráfica de espectros sin procesar (espectro completo)
+```{r}
+library(ggplot2)
+library(dplyr)
+
+datos <- lapply(Mezclas, function(f) {
+  df <- read.csv(f, sep = ";", header = FALSE)
+  colnames(df) <- c("cm_1", "Absorbancia")
+  df$Muestra <- basename(f)
+  df
+})
+
+df_largo <- bind_rows(datos)
+ggplot(df_largo, aes(x = cm_1, y = Absorbancia, color = Muestra)) +
+  geom_line(alpha = 0.7) +
+  scale_x_reverse() +
+  labs(
+    x = "Longitud de Onda (cm⁻¹)",
+    y = "Absorbancia"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+#Gráfica luego del recorte espectral
+```{r}
+library(dplyr)
+
+espectros_crop <- bind_rows(
+  lapply(seq_along(datos_recortados), function(i) {
+    df <- datos_recortados[[i]]
+    df$Muestra <- tools::file_path_sans_ext(basename(Mezclas[i]))
+    return(df)
+  })
+)
+library(ggplot2)
+
+ggplot(espectros_crop, aes(x = x, y = y, group = Muestra, color = Muestra)) +
+  geom_line(alpha = 0.8, linewidth = 0.6) +
+  labs(
+    x = "Número de onda (cm⁻¹)",
+    y = "Absorbancia",
+    title = "Espectros FTIR recortados (850–1200 cm⁻¹)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+```
+
+##Preprocesado
+```{r}
+data_a <- Primeraderivada(data_a2_obj_crop)
+datos_ir_a<-Segundaderivada_ir(data_a)
+
+mazucares_df<- as.matrix(fun_to_spectra(data_a))
+mazucares_df2<-as.matrix(datos_ir_a)
+```
+
+##Gráfica de espectros luego de la primera derivada
+```{r}
+df_der1 <- as.data.frame(mazucares_df)
+df_der1$Muestra <- rownames(df_der1)
+
+df_der1_long <- df_der1 %>%
+  tidyr::pivot_longer(
+    cols = -Muestra,
+    names_to = "Numero_onda",
+    values_to = "Absorbancia"
+  )
+
+df_der1_long$Numero_onda <- as.numeric(df_der1_long$Numero_onda)
+ggplot(df_der1_long,
+       aes(x = Numero_onda, y = Absorbancia, group = Muestra)) +
+  geom_line(color = "red", alpha = 0.35) +
+  labs(
+    x = "Número de onda (cm⁻¹)",
+    y = "Primera derivada (ER) de la absorbancia",
+    title = "Espectros FTIR – Primera derivada (850–1200 cm⁻¹)"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+```
+```
+
+#Gráfica de espectros luego de la segunda derivada
+```{r}
+```{r}
+df_der2 <- as.data.frame(mazucares_df2)
+df_der2$Muestra <- rownames(df_der2)
+
+df_der2_long <- df_der2 %>%
+  tidyr::pivot_longer(
+    cols = -Muestra,
+    names_to = "Numero_onda",
+    values_to = "Absorbancia"
+  )
+
+df_der2_long$Numero_onda <- as.numeric(df_der2_long$Numero_onda)
+ggplot(df_der2_long,
+       aes(x = Numero_onda, y = Absorbancia, group = Muestra)) +
+  geom_line(color = "darkgreen", alpha = 0.35) +
+  labs(
+    x = "Número de onda (cm⁻¹)",
+    y = "Segunda derivada (ER) de la absorbancia",
+    title = "Espectros FTIR – Segunda derivada (850–1200 cm⁻¹)"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+```
+
+
+
+
+#PCA
+##Primera derivada
+```{r}
+limpio <- as.matrix(mazucares_df)
+limpio <- apply(limpio, 2, as.numeric)
+
+# Eliminar columnas con más de 20% de NA
+prop_na <- colMeans(is.na(limpio))
+limpio <- limpio[, prop_na < 0.2]
+
+# Reemplazar NA restantes por la media de la columna
+for (j in 1:ncol(limpio)) {
+  col <- limpio[, j]
+  col[is.na(col)] <- mean(col, na.rm = TRUE)
+  limpio[, j] <- col
+}
+
+# Eliminar columnas constantes
+sds <- apply(limpio, 2, sd)
+limpio <- limpio[, sds > 0]
+
+pcx <- prcomp(limpio, center = TRUE, scale. = FALSE)
+scores <- as.data.frame(pcx$x)
+```
+
+###Gráfico
+```{r}
+scores_pca <- as.data.frame(pcx$x[, 1:2])
+colnames(scores_pca) <- c("PC1", "PC2")
+
+formulacion_id <- factor(rep(1:32, each = 3))
+
+scores_pca$formulacion <- formulacion_id   # <-- asegúrate que tenga el mismo orden
+
+var_exp <- (pcx$sdev^2) / sum(pcx$sdev^2) * 100
+
+pc1_var <- round(var_exp[1], 2)
+pc2_var <- round(var_exp[2], 2)
+
+library(ggplot2)
+
+ggplot(scores_pca, aes(PC1, PC2, color = formulacion)) +
+  geom_point(size = 2) +
+  geom_path(aes(group = formulacion), alpha = 0.4) +
+  theme_minimal(base_size = 13) +
+  labs(
+    x = paste0("PC1 ", round((pcx$sdev[1]^2 / sum(pcx$sdev^2)) * 100, 2), "%"),
+    y = paste0("PC2 ", round((pcx$sdev[2]^2 / sum(pcx$sdev^2)) * 100, 2), "%")
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  )
+
+```
+
+##Segunda derivada
+```{r}
+limpio2 <- as.matrix(mazucares_df2)
+limpio2 <- apply(limpio2, 2, as.numeric)
+sds2 <- apply(limpio2, 2, sd)
+limpio2 <- limpio2[, sds2 > 0]
+
+
+pcx2 <- prcomp(limpio2, center = TRUE, scale. = FALSE)
+scores2 <- as.data.frame(pcx2$x)
+```
+
+```{r}
+scores_pca <- as.data.frame(pcx2$x[, 1:2])
+colnames(scores_pca) <- c("PC1", "PC2")
+
+formulacion_id <- factor(rep(1:32, each = 3))
+
+scores_pca$formulacion <- formulacion_id   # <-- asegúrate que tenga el mismo orden
+
+var_exp <- (pcx2$sdev^2) / sum(pcx2$sdev^2) * 100
+
+pc1_var <- round(var_exp[1], 2)
+pc2_var <- round(var_exp[2], 2)
+
+library(ggplot2)
+
+ggplot(scores_pca, aes(PC1, PC2, color = formulacion)) +
+  geom_point(size = 2) +
+  geom_path(aes(group = formulacion), alpha = 0.4) +
+  theme_minimal(base_size = 13) +
+  labs(
+    x = paste0("PC1 ", round((pcx2$sdev[1]^2 / sum(pcx2$sdev^2)) * 100, 2), "%"),
+    y = paste0("PC2 ", round((pcx2$sdev[2]^2 / sum(pcx2$sdev^2)) * 100, 2), "%")
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  )
+
+```
+
+#División en Training y Test
+```{r}
+set.seed(123)
+Xpda <- as.matrix(limpio2)  # 2da derivada
+Ypda <- design[, c("Sacarosa", "Fructosa", "Glucosa")]
+Ypda <- design[rep(1:nrow(design), each = 3), ]
+formulación_id <- rep(1:32, each = 3)
+
+#Dividir por formulación
+unique_ids <- unique(formulación_id)
+train_ids <- sample(unique_ids, size = round(0.7 * length(unique_ids)))
+
+train_idx <- which(formulación_id %in% train_ids)
+test_idx  <- which(!formulación_id %in% train_ids)
+
+train.Xpda <- Xpda[train_idx, ]
+train.Ypda <- Ypda[train_idx, ]
+
+test.Xpda <- Xpda[test_idx, ]
+test.Ypda <- Ypda[test_idx, ]
+validation = "CV"
+segments = 10
+```
+
+##PLS
+```{r}
+library(pls)
+X <- as.matrix(limpio2)
+Y <- as.matrix(design[, c("Glucosa", "Fructosa", "Sacarosa")])
+Y <- design[rep(1:nrow(design), each = 3), ]
+```
+
+```{r}
+set.seed(123)
+
+datos_pls <- data.frame(Y, X)
+
+modelo_pls <- plsr(
+  as.matrix(Y) ~ as.matrix(X),
+  ncomp= 12,
+  validation = "CV",
+  scale = FALSE
+)
+
+validationplot(modelo_pls, val.type = "RMSEP")
+```
+
+###Coeficientes del modelo
+```{r}
+coef_pls <- coef(modelo_pls, ncomp = 12)
+coef_vec <- as.vector(coef_pls)
+
+coef_df <- data.frame(
+  Numero_onda = colnames(X),
+  Coeficiente = coef_vec
+)
+
+head(coef_df)
+coef_df |>
+  dplyr::arrange(desc(abs(Coeficiente))) |>
+  head(15)
+```
+
+
+###Predicción y mejor modelo
+```{r}
+pred_test <- predict(modelo_pls, newdata = as.matrix(test.Xpda), ncomp = 12)
+pred_comp1 <- pred_test[, , 1]
+if (dim(pred_test)[3] >= 2) {
+pred_comp2 <- pred_test[, , 2]}
+if (dim(pred_test)[3] >= 3) {
+pred_comp3 <- pred_test[, , 3]}
+
+pred_df <- as.data.frame(pred_test)
+pred_df$formulación_id <- formulación_id[test_idx]
+pred_df$réplica <- ave(pred_df$formulación_id, pred_df$formulación_id, FUN = seq_along)
+
+pred_df <- pred_df[, c("formulación_id", "réplica",
+                       setdiff(colnames(pred_df),
+                               c("formulación_id", "réplica")))]
+pred_df
+
+```
+
+###RMSE
+```{r}
+rmse_glu <- funrmse(pred_comp1[,1], test.Ypda[,1])
+rmse_fru <- funrmse(pred_comp1[,2], test.Ypda[,2])
+rmse_sac <- funrmse(pred_comp1[,3], test.Ypda[,3])
+rmse_glu
+rmse_fru
+rmse_sac
+```
+##R² por analito
+```{r}
+funR2 <- function(pred, obs) {
+  ss_res <- sum((obs - pred)^2)
+  ss_tot <- sum((obs - mean(obs))^2)
+  R2 <- 1 - (ss_res / ss_tot)
+  return(R2)
+}
+```
+
+```{r}
+R2_glu  <- funR2(pred_comp1[,1], test.Ypda[,1])
+R2_fru <- funR2(pred_comp1[,2], test.Ypda[,2])
+R2_sac <- funR2(pred_comp1[,3], test.Ypda[,3])
+
+R2_glu
+R2_fru
+R2_sac
+```
+
+##Tabla de métricas
+```{r}
+tabla_metricas <- data.frame(
+  Analito = c("Glucosa", "Fructosa", "Sacarosa"),
+  RMSE = c(rmse_glu, rmse_fru, rmse_sac),
+  R2   = c(R2_glu, R2_fru, R2_sac)
+)
+
+tabla_metricas
+```
+
+##Gráfica Observado vs. Predicho
+```{r}
+pred_glu <- pred_comp1[, 1]
+pred_fru <- pred_comp1[, 2]
+pred_sac <- pred_comp1[, 3]
+
+obs_glu <- test.Ypda[, 1]
+obs_fru <- test.Ypda[, 2]
+obs_sac <- test.Ypda[, 3]
+```
+
+###Glucosa
+```{r}
+plot(obs_glu, pred_glu,
+     xlab = "Glucosa observada",
+     ylab = "Glucosa predicha",
+     main = "PLS – Glucosa",
+     pch = 19)
+abline(0, 1, col = "red", lwd = 2)
+```
+###Fructosa
+```{r}
+plot(obs_fru, pred_fru,
+     xlab = "Fructosa observada",
+     ylab = "Fructosa predicha",
+     main = "PLS – Fructosa",
+     pch = 19)
+abline(0, 1, col = "blue", lwd = 2)
+
+```
+###Sacarosa
+```{r}
+plot(obs_sac, pred_sac,
+     xlab = "Sacarosa observada",
+     ylab = "Sacarosa predicha",
+     main = "PLS – Sacarosa",
+     pch = 19)
+abline(0, 1, col = "green", lwd = 2)
+
+```
+
+#Validación del modelo con muestras de bebidas comerciales
+```{r}
+library(ir)
+
+archivos_validacion2 <- list.files("./data_validacionbebidas/",
+                                  pattern = "\\.csv$|\\.CSV$",
+                                  full.names = TRUE,
+                                  ignore.case = TRUE)
+
+leer_y_recortar2 <- function(archivo) {
+  datos <- read.csv(archivo, sep = ";", header = FALSE)
+  datos <- datos[complete.cases(datos), ]
+  
+  idx <- datos[[1]] >= 850 & datos[[1]] <= 1200
+  datos_filtrados2 <- datos[idx, ]
+  
+  colnames(datos_filtrados2) <- c("x", "y")
+  
+  return(datos_filtrados2)
+}
+
+datos_validacionbebidas <- lapply(archivos_validacion2, leer_y_recortar2)
+
+metadata_validacion <- data.frame(
+  sample_id = tools::file_path_sans_ext(basename(archivos_validacion2)),
+  filename = basename(archivos_validacion2),
+  stringsAsFactors = FALSE
+)
+
+data_ir_validacion2 <- metadata_validacion
+data_ir_validacion2$spectra <- datos_validacionbebidas
+
+ir_validacion2 <- ir_as_ir(data_ir_validacion2)
+```
+
+##Preprocesado
+```{r}
+ir_val_pre3 <- Primeraderivada(ir_validacion2)
+ir_val_pre4 <-Segundaderivada_ir(ir_val_pre3)
+
+mvalidacion_df3<- as.matrix(fun_to_spectra(ir_val_pre3))
+mvalidacion_df4<-as.matrix(ir_val_pre4)
+
+X_comercial <- apply(mvalidacion_df4, 2, as.numeric)
+orden_correcto <- c("CocaCola.1", "CocaCola.2", "CocaCola.3", "Gatorade.1", "Gatorade.2", "Gatorade.3", "Jugo.1", "Jugo.2", "Jugo.3")
+rownames(X_comercial) <- orden_correcto
+```
+
+##Interpolar al grid del entrenamiento
+```{r}
+colnames(X_comercial) <- as.character(colnames(X_comercial))
+colnames_entrenamiento <- as.character(colnames(test.Xpda))
+
+lambda_train <- as.numeric(colnames_entrenamiento)
+lambda_comercial <- as.numeric(colnames(X_comercial))
+interpolar_espectro <- function(y, x_old, x_new) {
+  approx(x = x_old, y = y, xout = x_new, rule = 2)$y
+}
+X_comercial_interp <- t(apply(X_comercial, 1, function(espectro) {
+  interpolar_espectro(espectro, lambda_comercial, lambda_train)
+}))
+colnames(X_comercial_interp) <- colnames_entrenamiento
+rownames(X_comercial_interp) <- rownames(X_comercial)
+```
+
+##Predicción exploratoria
+```{r}
+Y_pred_comercial <- predict(modelo_pls, newdata = X_comercial_interp, ncomp = 12)
+Y_pred_comercial <- as.data.frame(Y_pred_comercial[,,1])
+colnames(Y_pred_comercial) <- colnames(Ypda)
+
+Y_pred_comercial$Total_azucares <- rowSums(Y_pred_comercial)
+
+Y_pred_comercial$Bebida <- c("CocaCola", "CocaCola", "CocaCola",
+                             "Gatorade", "Gatorade", "Gatorade",
+                             "Pulp", "Pulp", "Pulp")
+Y_pred_comercial <- Y_pred_comercial[, c("Bebida", colnames(Y_pred_comercial)[-ncol(Y_pred_comercial)])]
+View(Y_pred_comercial)
+```
+
+##Gráficas
+###Boxplot por bebida
+```{r}
+library(reshape2)
+library(ggplot2)
+
+df_long <- melt(Y_pred_comercial,
+                id.vars = "Bebida",
+                measure.vars = c("Glucosa", "Fructosa", "Sacarosa"))
+
+ggplot(df_long, aes(x = Bebida, y = value, fill = Bebida)) +
+  geom_boxplot(alpha = 0.6) +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(y = "Concentración (%)",
+       title = "Distribución de azúcares por bebida") +
+  theme_minimal()
+
+```
